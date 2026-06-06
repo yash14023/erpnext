@@ -75,9 +75,10 @@
   },
   {
    "fieldname": "customer_email",
-   "fieldtype": "Data",
-   "label": "Email",
-   "reqd": 1
+    "fieldtype": "Data",
+    "label": "Email",
+    "options": "Email",
+    "reqd": 1
   },
   {
    "fieldname": "linked_docs_section",
