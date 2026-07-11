@@ -574,9 +574,6 @@ def apply_pricing_rule_on_transaction(doc):
 
 		for d in pricing_rules:
 			if d.price_or_product_discount == "Price":
-				if d.apply_discount_on:
-					doc.set("apply_discount_on", d.apply_discount_on)
-				# Variable to track whether the condition has been met
 				condition_met = False
 
 				for field in ["additional_discount_percentage", "discount_amount"]:
@@ -594,6 +591,8 @@ def apply_pricing_rule_on_transaction(doc):
 					else:
 						if not d.coupon_code_based:
 							doc.set(field, d.get(pr_field))
+							if d.apply_discount_on:
+								doc.set("apply_discount_on", d.apply_discount_on)
 						elif doc.get("coupon_code"):
 							# coupon code based pricing rule
 							coupon_code_pricing_rule = frappe.db.get_value(
@@ -602,6 +601,8 @@ def apply_pricing_rule_on_transaction(doc):
 							if coupon_code_pricing_rule == d.name:
 								# if selected coupon code is linked with pricing rule
 								doc.set(field, d.get(pr_field))
+								if d.apply_discount_on:
+									doc.set("apply_discount_on", d.apply_discount_on)
 
 								# Set the condition_met variable to True and break out of the loop
 								condition_met = True
