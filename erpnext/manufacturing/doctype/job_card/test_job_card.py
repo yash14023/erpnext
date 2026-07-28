@@ -10,7 +10,6 @@ from frappe.utils.data import add_to_date, now, today
 
 from erpnext.manufacturing.doctype.job_card.job_card import (
 	JobCardOverTransferError,
-	OperationMismatchError,
 	OverlapError,
 )
 from erpnext.manufacturing.doctype.job_card.mapper import (
@@ -149,18 +148,39 @@ class TestJobCard(ERPNextTestSuite):
 		)
 		self.assertRaises(frappe.ValidationError, job_card_doc.submit)
 
-	def test_job_card_operations(self):
-		job_cards = frappe.get_all(
-			"Job Card", filters={"work_order": self.work_order.name}, fields=["operation_id", "name"]
+	def test_set_operation_id(self):
+		work_order = make_wo_order_test_record(item="_Test FG Item 2", qty=2, do_not_submit=1)
+		operation_row = work_order.operations[0]
+
+		job_card = frappe.new_doc("Job Card")
+		job_card.work_order = work_order.name
+		job_card.operation = operation_row.operation
+		job_card.set_operation_id()
+		self.assertEqual(job_card.operation_id, operation_row.name)
+
+		work_order.append(
+			"operations",
+			{
+				"operation": operation_row.operation,
+				"workstation": operation_row.workstation,
+				"time_in_mins": operation_row.time_in_mins,
+				"hour_rate": operation_row.hour_rate,
+				"sequence_id": work_order.operations[-1].sequence_id,
+			},
 		)
+		work_order.save()
 
-		if job_cards:
-			job_card = job_cards[0]
-			frappe.db.set_value("Job Card", job_card.name, "operation_row_number", job_card.operation_id)
+		job_card = frappe.new_doc("Job Card")
+		job_card.work_order = work_order.name
+		job_card.operation = operation_row.operation
+		self.assertRaises(frappe.ValidationError, job_card.set_operation_id)
 
-			doc = frappe.get_doc("Job Card", job_card.name)
-			doc.operation_id = "Test Data"
-			self.assertRaises(OperationMismatchError, doc.save)
+		job_card.operation_id = "bogus-row"
+		self.assertRaises(frappe.ValidationError, job_card.set_operation_id)
+
+		job_card.operation_id = work_order.operations[-1].name
+		job_card.set_operation_id()
+		self.assertEqual(job_card.operation_id, work_order.operations[-1].name)
 
 	def test_job_card_with_different_work_station(self):
 		job_cards = frappe.get_all(
@@ -1165,6 +1185,109 @@ class TestJobCard(ERPNextTestSuite):
 		self.assertEqual(manufacturing_entry.items[2].item_code, scrap2.name)
 		self.assertEqual(manufacturing_entry.items[2].qty, 9)
 		self.assertEqual(flt(manufacturing_entry.items[2].basic_rate, 3), 5.278)
+
+	def test_semi_fg_produced_qty_across_split_job_cards(self):
+		from erpnext.manufacturing.doctype.operation.test_operation import make_operation
+		from erpnext.manufacturing.doctype.work_order.mapper import make_job_card
+		from erpnext.stock.doctype.item.test_item import make_item
+
+		warehouse = "Stores - _TC"
+		rm = make_item("Split JC RM 1", {"is_stock_item": 1}).name
+		fg = make_item("Split JC FG 1", {"is_stock_item": 1}).name
+
+		fg_bom = frappe.new_doc(
+			"BOM",
+			company="_Test Company",
+			item=fg,
+			quantity=1,
+			with_operations=1,
+			track_semi_finished_goods=1,
+		)
+		fg_bom.append("items", {"item_code": rm, "qty": 1, "operation_row_id": 1})
+
+		operation = {
+			"operation": "Split JC Op A",
+			"workstation": "_Test Workstation A",
+			"finished_good": fg,
+			"finished_good_qty": 1,
+			"is_final_finished_good": 1,
+			"sequence_id": 1,
+			"time_in_mins": 60,
+			"source_warehouse": warehouse,
+			"fg_warehouse": warehouse,
+			"skip_material_transfer": 1,
+		}
+		make_workstation(operation)
+		make_operation(operation)
+		fg_bom.append("operations", operation)
+		fg_bom.insert()
+		fg_bom.submit()
+
+		work_order = make_wo_order_test_record(
+			item=fg,
+			qty=8,
+			source_warehouse=warehouse,
+			fg_warehouse=warehouse,
+			bom_no=fg_bom.name,
+			skip_transfer=1,
+			do_not_save=True,
+		)
+		work_order.operations[0].time_in_mins = 60
+		work_order.save()
+		work_order.submit()
+
+		make_stock_entry(item_code=rm, target=warehouse, qty=100, basic_rate=100)
+
+		job_card = frappe.get_doc(
+			"Job Card", frappe.db.get_value("Job Card", {"work_order": work_order.name}, "name")
+		)
+		job_card.for_quantity = 5
+		job_card.append(
+			"time_logs",
+			{"from_time": "2024-02-01 08:00:00", "to_time": "2024-02-01 09:00:00", "completed_qty": 5},
+		)
+		job_card.save()
+		job_card.submit()
+		frappe.get_doc(job_card.make_stock_entry_for_semi_fg_item()).submit()
+
+		work_order.reload()
+		self.assertEqual(flt(work_order.produced_qty), 5)
+
+		make_job_card(
+			work_order.name,
+			[
+				{
+					"name": work_order.operations[0].name,
+					"operation": "Split JC Op A",
+					"qty": 3,
+					"pending_qty": 3,
+					"skip_material_transfer": 1,
+				}
+			],
+		)
+
+		job_card = frappe.get_doc(
+			"Job Card", frappe.db.get_value("Job Card", {"work_order": work_order.name, "docstatus": 0})
+		)
+		job_card.append(
+			"time_logs",
+			{
+				"from_time": "2024-02-02 08:00:00",
+				"to_time": "2024-02-02 09:00:00",
+				"completed_qty": job_card.for_quantity,
+			},
+		)
+		job_card.save()
+		job_card.submit()
+		frappe.get_doc(job_card.make_stock_entry_for_semi_fg_item()).submit()
+
+		work_order.reload()
+		self.assertEqual(flt(work_order.produced_qty), 8)
+		self.assertEqual(work_order.status, "Completed")
+		self.assertEqual(
+			flt(frappe.db.get_value("Work Order Operation", work_order.operations[0].name, "completed_qty")),
+			8,
+		)
 
 	def test_semi_fg_batch_auto_pull_on_manufacture(self):
 		"""Batch produced by an operation should auto-pull into the next operation's

@@ -45,10 +45,6 @@ class OverlapError(frappe.ValidationError):
 	pass
 
 
-class OperationMismatchError(frappe.ValidationError):
-	pass
-
-
 class OperationSequenceError(frappe.ValidationError):
 	pass
 
@@ -106,7 +102,6 @@ class JobCard(Document):
 		operation: DF.Link
 		operation_id: DF.Data | None
 		operation_row_id: DF.Int
-		operation_row_number: DF.Literal[None]
 		pending_qty: DF.Float
 		posting_date: DF.Date | None
 		process_loss_qty: DF.Float
@@ -168,7 +163,7 @@ class JobCard(Document):
 		self.validate_time_logs()
 		self.validate_on_hold()
 		self.set_status()
-		self.validate_operation_id()
+		self.set_operation_id()
 		self.validate_sequence_id()
 		self.set_sub_operations()
 		self.update_sub_operation_status()
@@ -1042,18 +1037,31 @@ class JobCard(Document):
 		return for_quantity, time_in_mins, process_loss_qty, pending_qty
 
 	def update_semi_finished_good_details(self):
-		if self.operation_id:
-			qty = max(flt(self.manufactured_qty), flt(self.total_completed_qty))
+		if not self.operation_id:
+			return
 
-			frappe.db.set_value("Work Order Operation", self.operation_id, "completed_qty", qty)
-			if (
-				self.finished_good
-				and frappe.get_cached_value("Work Order", self.work_order, "production_item")
-				== self.finished_good
-			):
-				_wo_doc = frappe.get_doc("Work Order", self.work_order)
-				_wo_doc.db_set("produced_qty", self.manufactured_qty)
-				_wo_doc.db_set("status", _wo_doc.get_status())
+		job_cards = frappe.get_all(
+			"Job Card",
+			filters={
+				"work_order": self.work_order,
+				"operation_id": self.operation_id,
+				"docstatus": 1,
+				"is_corrective_job_card": 0,
+			},
+			fields=["manufactured_qty", "total_completed_qty"],
+		)
+
+		completed_qty = sum(max(flt(row.manufactured_qty), flt(row.total_completed_qty)) for row in job_cards)
+
+		frappe.db.set_value("Work Order Operation", self.operation_id, "completed_qty", completed_qty)
+		if (
+			self.finished_good
+			and frappe.get_cached_value("Work Order", self.work_order, "production_item")
+			== self.finished_good
+		):
+			_wo_doc = frappe.get_doc("Work Order", self.work_order)
+			_wo_doc.db_set("produced_qty", sum(flt(row.manufactured_qty) for row in job_cards))
+			_wo_doc.db_set("status", _wo_doc.get_status())
 
 	def update_corrective_in_work_order(self, wo):
 		wo.corrective_operation_cost = 0.0
@@ -1344,21 +1352,33 @@ class JobCard(Document):
 		if not self.wip_warehouse:
 			self.wip_warehouse = frappe.get_cached_value("Company", self.company, "default_wip_warehouse")
 
-	def validate_operation_id(self):
-		if (
-			self.get("operation_id")
-			and self.get("operation_row_number")
-			and self.operation
-			and self.work_order
-			and frappe.get_cached_value("Work Order Operation", self.operation_row_number, "name")
-			!= self.operation_id
-		):
-			work_order = bold(get_link_to_form("Work Order", self.work_order))
+	def set_operation_id(self):
+		if not (self.work_order and self.operation):
+			return
+
+		if self.operation_id and self.docstatus != 0:
+			return
+
+		operation_rows = frappe.get_all(
+			"Work Order Operation",
+			filters={"parent": self.work_order, "operation": self.operation},
+			pluck="name",
+		)
+
+		if self.operation_id:
+			if operation_rows and self.operation_id not in operation_rows:
+				frappe.throw(
+					_("Operation {0} does not belong to the work order {1}").format(
+						bold(self.operation), get_link_to_form("Work Order", self.work_order)
+					)
+				)
+		elif len(operation_rows) == 1:
+			self.operation_id = operation_rows[0]
+		elif operation_rows and self.docstatus == 0:
 			frappe.throw(
-				_("Operation {0} does not belong to the work order {1}").format(
-					bold(self.operation), work_order
-				),
-				OperationMismatchError,
+				_(
+					"Operation {0} is added multiple times in the work order {1}. Please select the operation row."
+				).format(bold(self.operation), get_link_to_form("Work Order", self.work_order))
 			)
 
 	@frappe.whitelist()
